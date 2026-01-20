@@ -812,27 +812,33 @@ local function send_terminal_notifier(subtitle, message, config)
     local tn_config = config.notifications.terminal_notifier or {}
     local binary = tn_config.path or 'terminal-notifier'
     local title = tn_config.title or 'WezTerm Agent Deck'
-    
-    local cmd = binary
-        .. ' -title ' .. shell_escape(title)
-        .. ' -subtitle ' .. shell_escape(subtitle)
-        .. ' -message ' .. shell_escape(message)
-    
+
+    local args = { binary, '-title', title, '-subtitle', subtitle, '-message', message }
+
     if tn_config.sound then
-        cmd = cmd .. ' -sound ' .. shell_escape(tn_config.sound)
+        table.insert(args, '-sound')
+        table.insert(args, tn_config.sound)
     end
-    
+
     if tn_config.group then
-        cmd = cmd .. ' -group ' .. shell_escape(tn_config.group)
+        table.insert(args, '-group')
+        table.insert(args, tn_config.group)
     end
-    
+
     if tn_config.activate then
-        cmd = cmd .. ' -sender com.github.wez.wezterm'
+        table.insert(args, '-sender')
+        table.insert(args, 'com.github.wez.wezterm')
     end
-    
-    -- Fire-and-forget: io.popen + read('*a') blocks WezTerm's main thread
-    -- and causes hangs/crashes when terminal-notifier is slow
-    os.execute(cmd .. ' >/dev/null 2>&1 &')
+
+    -- Use non-blocking background process to avoid hanging wezterm's main thread
+    -- io.popen/os.execute both call into libc read/system which block the event loop
+    local success, err = pcall(function()
+        wezterm.background_child_process(args)
+    end)
+    if not success then
+        wezterm.log_warn('[agent-deck] terminal-notifier spawn failed: ' .. tostring(err))
+        return false
+    end
     return true
 end
 
