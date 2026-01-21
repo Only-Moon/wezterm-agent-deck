@@ -124,9 +124,17 @@ local function detect_from_process_info(executable, argv_str, config)
                 return agent_name
             end
             
-            -- Check executable name
+            -- Check executable name against specific patterns
             if matches_any_pattern(exe_name, exe_patterns) then
                 return agent_name
+            end
+            
+            -- Fallback: check against generic patterns (catches bare process names like 'opencode')
+            local generic_patterns = agent_config.patterns
+            if generic_patterns and #generic_patterns > 0 then
+                if matches_any_pattern(executable, generic_patterns) or matches_any_pattern(exe_name, generic_patterns) then
+                    return agent_name
+                end
             end
             
             -- Check argv string

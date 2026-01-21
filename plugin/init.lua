@@ -66,7 +66,58 @@ local state = {
     initialized = false,
     agent_states = {},  -- pane_id -> { agent_type, status, last_update, cooldown_start }
     last_notification = {},  -- pane_id -> timestamp
+    last_cleanup = 0,  -- timestamp of last cache cleanup
 }
+
+-- Cache cleanup interval (30 seconds)
+local CLEANUP_INTERVAL_MS = 30000
+-- Max age for cache entries before cleanup (60 seconds)
+local MAX_CACHE_AGE_MS = 60000
+
+--[[ ============================================
+     Cache Cleanup (memory leak prevention)
+     ============================================ ]]
+
+local function get_all_pane_ids(window)
+    local pane_ids = {}
+    local success, _ = pcall(function()
+        for _, mux_tab in ipairs(window:mux_window():tabs()) do
+            for _, p in ipairs(mux_tab:panes()) do
+                pane_ids[p:pane_id()] = true
+            end
+        end
+    end)
+    return pane_ids
+end
+
+local function cleanup_stale_entries(window)
+    local now = os.time() * 1000
+    
+    if (now - state.last_cleanup) < CLEANUP_INTERVAL_MS then
+        return
+    end
+    
+    state.last_cleanup = now
+    local active_panes = get_all_pane_ids(window)
+    
+    for pane_id, _ in pairs(state.agent_states) do
+        if not active_panes[pane_id] then
+            state.agent_states[pane_id] = nil
+        end
+    end
+    
+    for pane_id, _ in pairs(state.last_notification) do
+        if not active_panes[pane_id] then
+            state.last_notification[pane_id] = nil
+        end
+    end
+    
+    for pane_id, entry in pairs(detection_cache) do
+        if not active_panes[pane_id] or (now - entry.timestamp) > MAX_CACHE_AGE_MS then
+            detection_cache[pane_id] = nil
+        end
+    end
+end
 
 --[[ ============================================
      Configuration Management (inline)
@@ -245,7 +296,7 @@ end
      ============================================ ]]
 
 local detection_cache = {}
-local CACHE_TTL_MS = 5000
+local CACHE_TTL_MS = 1500
 
 local function get_executable_name(path)
     if not path then return '' end
@@ -292,6 +343,13 @@ local function detect_from_process_info(executable, argv_str, config)
             local exe_patterns = get_patterns_for_phase(agent_config, 'executable', agent_name)
             if matches_any_pattern(executable, exe_patterns) or matches_any_pattern(exe_name, exe_patterns) then
                 return agent_name
+            end
+            -- Fallback: check against generic patterns (catches bare process names like 'opencode')
+            local generic_patterns = agent_config.patterns
+            if generic_patterns and #generic_patterns > 0 then
+                if matches_any_pattern(executable, generic_patterns) or matches_any_pattern(exe_name, generic_patterns) then
+                    return agent_name
+                end
             end
             local argv_patterns = get_patterns_for_phase(agent_config, 'argv', agent_name)
             if matches_any_pattern(argv_str, argv_patterns) then
@@ -443,16 +501,24 @@ local function matches_any_status(text, patterns)
     return false
 end
 
-local function get_last_lines(text, n)
-    if not text then return '' end
+--- Split text into lines once, return reusable table
+local function split_lines(text)
+    if not text then return {} end
     local lines = {}
     for line in text:gmatch('[^\n]+') do
-        table.insert(lines, line)
+        lines[#lines + 1] = line
     end
-    local start = math.max(1, #lines - n + 1)
+    return lines
+end
+
+--- Get last N entries from a pre-split lines table
+local function last_n_lines(lines, n)
+    local count = #lines
+    if count == 0 then return '' end
+    local start = math.max(1, count - n + 1)
     local result = {}
-    for i = start, #lines do
-        table.insert(result, lines[i])
+    for i = start, count do
+        result[#result + 1] = lines[i]
     end
     return table.concat(result, '\n')
 end
@@ -480,12 +546,14 @@ local function detect_status(pane, agent_type, config)
         }
     end
 
-    -- Check in priority order: idle > working > waiting
-    local last_lines = get_last_lines(clean_text, 5)
-    local last_line_empty = false
+    -- Split lines ONCE and reuse
+    local lines = split_lines(clean_text)
+    if #lines == 0 then return 'inactive' end
 
-    for line in last_lines:gmatch('[^\n]+') do
-        local trimmed = line:match('^%s*(.-)%s*$') or ''
+    -- Check last 5 lines for idle indicators
+    local start_5 = math.max(1, #lines - 4)
+    for i = start_5, #lines do
+        local trimmed = lines[i]:match('^%s*(.-)%s*$') or ''
 
         -- Check for ">" prompt (Claude/OpenCode prompt starts with >)
         if trimmed == '>' or trimmed:match('^>%s') then
@@ -499,18 +567,13 @@ local function detect_status(pane, agent_type, config)
     end
 
     -- Check if last line is empty/whitespace (OpenCode idle state)
-    local lines = {}
-    for line in clean_text:gmatch('[^\n]+') do
-        table.insert(lines, line)
-    end
-    if #lines > 0 then
-        local last = lines[#lines]:match('^%s*(.-)%s*$') or ''
-        last_line_empty = (last == '')
-    end
+    local last_trimmed = lines[#lines]:match('^%s*(.-)%s*$') or ''
+    local last_line_empty = (last_trimmed == '')
 
-    -- Check working before waiting
-    local very_recent = get_last_lines(clean_text, 10)
-    if matches_any_status(very_recent, patterns.working) then
+    -- Check last 10 lines for working/waiting (reuse the single split)
+    local recent_text = last_n_lines(lines, 10)
+
+    if matches_any_status(recent_text, patterns.working) then
         return 'working'
     end
 
@@ -519,8 +582,7 @@ local function detect_status(pane, agent_type, config)
         return 'idle'
     end
 
-    -- Check waiting only in very recent lines (reduce false positives from scrollback)
-    local recent_text = get_last_lines(clean_text, 10)
+    -- Check waiting only in recent lines (reduce false positives from scrollback)
     if matches_any_status(recent_text, patterns.waiting) then
         return 'waiting'
     end
@@ -768,17 +830,10 @@ local function send_terminal_notifier(subtitle, message, config)
         cmd = cmd .. ' -sender com.github.wez.wezterm'
     end
     
-    local handle = io.popen(cmd .. ' 2>&1', 'r')
-    if handle then
-        local result = handle:read('*a')
-        local success, _, code = handle:close()
-        if not success or code ~= 0 then
-            wezterm.log_warn('[agent-deck] terminal-notifier failed: ' .. (result or 'unknown error'))
-            return false
-        end
-        return true
-    end
-    return false
+    -- Fire-and-forget: io.popen + read('*a') blocks WezTerm's main thread
+    -- and causes hangs/crashes when terminal-notifier is slow
+    os.execute(cmd .. ' >/dev/null 2>&1 &')
+    return true
 end
 
 local function notify_waiting(pane, agent_type, config)
@@ -847,6 +902,7 @@ local function update_agent_state(pane, config)
         if current_state then
             local old_status = current_state.status
             state.agent_states[pane_id] = nil
+            detection_cache[pane_id] = nil
             wezterm.emit('agent_deck.agent_finished', nil, pane, current_state.agent_type)
             if old_status ~= 'inactive' then
                 wezterm.emit('agent_deck.status_changed', nil, pane, old_status, 'inactive', nil)
@@ -870,8 +926,9 @@ local function update_agent_state(pane, config)
         
         if new_status == 'waiting' then
             notify_waiting(pane, agent_type, config)
+            state.last_notification[pane_id] = now
         end
-        
+
         return current_state
     end
     
@@ -968,6 +1025,8 @@ function M.apply_to_config(config, opts)
     -- Status bar (right status)
     if plugin_config.right_status.enabled then
         wezterm.on('update-status', function(window, pane)
+            cleanup_stale_entries(window)
+            
             for _, mux_tab in ipairs(window:mux_window():tabs()) do
                 for _, p in ipairs(mux_tab:panes()) do
                     update_agent_state(p, plugin_config)
@@ -983,6 +1042,8 @@ function M.apply_to_config(config, opts)
         end)
     else
         wezterm.on('update-status', function(window, pane)
+            cleanup_stale_entries(window)
+            
             for _, mux_tab in ipairs(window:mux_window():tabs()) do
                 for _, p in ipairs(mux_tab:panes()) do
                     update_agent_state(p, plugin_config)
