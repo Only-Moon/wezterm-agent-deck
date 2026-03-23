@@ -148,6 +148,10 @@ local agent_deck = dofile('/path/to/wezterm-agent-deck/plugin/init.lua')
 
 Debug via WezTerm console (Ctrl+Shift+L).
 
+
+## Type Annotations
+
+Lua LSP type annotations for this plugin are available via [wezterm-types](https://github.com/DrKJeff16/wezterm-types).
 ## License
 
 MIT
