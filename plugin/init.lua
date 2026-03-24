@@ -826,7 +826,7 @@ local function send_terminal_notifier(subtitle, message, config)
     end
 
     if tn_config.activate then
-        table.insert(args, '-sender')
+        table.insert(args, '-activate')
         table.insert(args, 'com.github.wez.wezterm')
     end
 
