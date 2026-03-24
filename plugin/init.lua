@@ -66,6 +66,10 @@ local state = {
     initialized = false,
     agent_states = {},  -- pane_id -> { agent_type, status, last_update, cooldown_start }
     last_notification = {},  -- pane_id -> timestamp
+    -- Tracks whether we've already notified for the current waiting state.
+    -- Stored outside agent_states so it survives agent detection flickers/state resets.
+    -- Cleared only when the agent has been confirmed working (sustained, not a flicker).
+    waiting_notified = {},  -- pane_id -> true
     last_cleanup = 0,  -- timestamp of last cache cleanup
 }
 
@@ -111,10 +115,18 @@ local function cleanup_stale_entries(window)
             state.last_notification[pane_id] = nil
         end
     end
+
+    for pane_id, _ in pairs(state.waiting_notified) do
+        if not active_panes[pane_id] then
+            state.waiting_notified[pane_id] = nil
+        end
+    end
     
-    for pane_id, entry in pairs(detection_cache) do
-        if not active_panes[pane_id] or (now - entry.timestamp) > MAX_CACHE_AGE_MS then
-            detection_cache[pane_id] = nil
+    if detection_cache then
+        for pane_id, entry in pairs(detection_cache) do
+            if not active_panes[pane_id] or (now - entry.timestamp) > MAX_CACHE_AGE_MS then
+                detection_cache[pane_id] = nil
+            end
         end
     end
 end
@@ -802,27 +814,40 @@ end
      ============================================ ]]
 
 local MIN_NOTIFICATION_GAP_MS = 10000
+local AGENT_GONE_GRACE_MS = 5000  -- Wait 5s before treating agent as truly gone
 
 local function shell_escape(str)
     if not str then return '' end
     return "'" .. str:gsub("'", "'\\''") .. "'"
 end
 
-local function send_terminal_notifier(subtitle, message, config)
+--- Build a per-pane notification group ID
+local function pane_group(config, pane_id)
+    local tn_config = config.notifications.terminal_notifier or {}
+    return (tn_config.group or 'wezterm-agent-deck') .. '-' .. tostring(pane_id)
+end
+
+local function send_terminal_notifier(subtitle, message, config, opts)
+    opts = opts or {}
     local tn_config = config.notifications.terminal_notifier or {}
     local binary = tn_config.path or 'terminal-notifier'
     local title = tn_config.title or 'WezTerm Agent Deck'
 
     local args = { binary, '-title', title, '-subtitle', subtitle, '-message', message }
 
-    if tn_config.sound then
+    -- Use per-call sound override, fall back to default
+    local sound = opts.sound
+    if sound == nil then
+        sound = tn_config.sound
+    end
+    if sound then
         table.insert(args, '-sound')
-        table.insert(args, tn_config.sound)
+        table.insert(args, sound)
     end
 
-    if tn_config.group then
+    if opts.group then
         table.insert(args, '-group')
-        table.insert(args, tn_config.group)
+        table.insert(args, opts.group)
     end
 
     if tn_config.activate then
@@ -830,8 +855,6 @@ local function send_terminal_notifier(subtitle, message, config)
         table.insert(args, 'com.github.wez.wezterm')
     end
 
-    -- Use non-blocking background process to avoid hanging wezterm's main thread
-    -- io.popen/os.execute both call into libc read/system which block the event loop
     local success, err = pcall(function()
         wezterm.background_child_process(args)
     end)
@@ -842,11 +865,16 @@ local function send_terminal_notifier(subtitle, message, config)
     return true
 end
 
-local function notify_waiting(pane, agent_type, config)
-    if not config.notifications.enabled or not config.notifications.on_waiting then
-        return
-    end
-    
+--- Remove a terminal-notifier notification by group
+local function remove_terminal_notification(config, group)
+    local tn_config = config.notifications.terminal_notifier or {}
+    local binary = tn_config.path or 'terminal-notifier'
+    pcall(function()
+        wezterm.background_child_process({ binary, '-remove', group })
+    end)
+end
+
+local function get_agent_display_name(agent_type)
     local agent_names = {
         opencode = 'OpenCode',
         claude = 'Claude',
@@ -854,39 +882,52 @@ local function notify_waiting(pane, agent_type, config)
         codex = 'Codex',
         aider = 'Aider',
     }
-    local agent_name = agent_names[agent_type] or agent_type
+    return agent_names[agent_type] or agent_type
+end
+
+local function notify_waiting(pane, agent_type, config)
+    if not config.notifications.enabled or not config.notifications.on_waiting then
+        return
+    end
+
+    local agent_name = get_agent_display_name(agent_type)
     local subtitle = agent_name .. ' - Attention Needed'
     local message = 'Needs your input'
     local timeout_ms = config.notifications.timeout_ms or 4000
     local backend = config.notifications.backend or 'native'
-    
+
     if backend == 'terminal-notifier' then
-        if send_terminal_notifier(subtitle, message, config) then
+        if send_terminal_notifier(subtitle, message, config, {
+            group = pane_group(config, pane:pane_id()),
+        }) then
             wezterm.log_info('[agent-deck] terminal-notifier sent: ' .. subtitle)
         end
         return
     end
-    
+
     local tab = pane:tab()
-    if not tab then
-        wezterm.log_warn('[agent-deck] notification failed: pane has no tab')
-        return
-    end
-    
+    if not tab then return end
     local mux_window = tab:window()
-    if not mux_window then
-        wezterm.log_warn('[agent-deck] notification failed: tab has no window')
-        return
-    end
-    
+    if not mux_window then return end
     local gui_window = mux_window:gui_window()
-    if not gui_window then
-        wezterm.log_warn('[agent-deck] notification failed: mux_window has no gui_window (headless?)')
-        return
-    end
-    
+    if not gui_window then return end
+
     gui_window:toast_notification(subtitle, message, nil, timeout_ms)
     wezterm.log_info('[agent-deck] notification sent: ' .. subtitle)
+end
+
+local function notify_finished(pane_id, config)
+    -- Clear any lingering waiting notification for this pane
+    if (config.notifications.backend or 'native') == 'terminal-notifier' then
+        remove_terminal_notification(config, pane_group(config, pane_id))
+    end
+end
+
+--- Remove the notification for a pane when it's no longer waiting
+local function clear_pane_notification(pane_id, config)
+    if (config.notifications.backend or 'native') == 'terminal-notifier' then
+        remove_terminal_notification(config, pane_group(config, pane_id))
+    end
 end
 
 --[[ ============================================
@@ -897,18 +938,42 @@ local function get_agent_state(pane_id)
     return state.agent_states[pane_id]
 end
 
+local function should_notify_waiting(pane_id)
+    return not state.waiting_notified[pane_id]
+end
+
+local function mark_waiting_notified(pane_id)
+    state.waiting_notified[pane_id] = true
+end
+
+local function clear_waiting_notified(pane_id)
+    state.waiting_notified[pane_id] = nil
+end
+
 local function update_agent_state(pane, config)
     local pane_id = pane:pane_id()
     local current_state = state.agent_states[pane_id]
     local now = os.time() * 1000
-    
+
     local agent_type = detect_agent(pane, config)
-    
+
     if not agent_type then
         if current_state then
+            -- Grace period: don't clear state immediately when detection flickers.
+            if not current_state.undetected_since then
+                current_state.undetected_since = now
+                current_state.last_update = now
+                return current_state
+            elseif (now - current_state.undetected_since) < AGENT_GONE_GRACE_MS then
+                current_state.last_update = now
+                return current_state
+            end
+
             local old_status = current_state.status
             state.agent_states[pane_id] = nil
             detection_cache[pane_id] = nil
+            clear_waiting_notified(pane_id)
+            notify_finished(pane_id, config)
             wezterm.emit('agent_deck.agent_finished', nil, pane, current_state.agent_type)
             if old_status ~= 'inactive' then
                 wezterm.emit('agent_deck.status_changed', nil, pane, old_status, 'inactive', nil)
@@ -916,9 +981,14 @@ local function update_agent_state(pane, config)
         end
         return nil
     end
-    
+
+    -- Agent re-detected, clear any grace period timer
+    if current_state then
+        current_state.undetected_since = nil
+    end
+
     local new_status = detect_status(pane, agent_type, config)
-    
+
     if not current_state then
         current_state = {
             agent_type = agent_type,
@@ -929,18 +999,19 @@ local function update_agent_state(pane, config)
         state.agent_states[pane_id] = current_state
         wezterm.emit('agent_deck.agent_detected', nil, pane, agent_type)
         wezterm.emit('agent_deck.status_changed', nil, pane, 'inactive', new_status, agent_type)
-        
-        if new_status == 'waiting' then
+
+        if new_status == 'waiting' and should_notify_waiting(pane_id) then
+            wezterm.log_warn('[agent-deck] NOTIFY new-agent pane=' .. pane_id)
             notify_waiting(pane, agent_type, config)
-            state.last_notification[pane_id] = now
+            mark_waiting_notified(pane_id)
         end
 
         return current_state
     end
-    
+
     local old_status = current_state.status
-    
-    -- Cooldown logic
+
+    -- Cooldown logic: working -> idle needs sustained idle before transitioning
     if old_status == 'working' and new_status == 'idle' then
         if not current_state.cooldown_start then
             current_state.cooldown_start = now
@@ -953,25 +1024,29 @@ local function update_agent_state(pane, config)
         current_state.cooldown_start = nil
     elseif new_status == 'working' then
         current_state.cooldown_start = nil
+        -- Agent confirmed working — next waiting state is a genuinely new question.
+        if state.waiting_notified[pane_id] then
+            wezterm.log_warn('[agent-deck] CLEAR waiting_notified pane=' .. pane_id .. ' (confirmed working)')
+            clear_pane_notification(pane_id, config)
+            clear_waiting_notified(pane_id)
+        end
     end
-    
+
     if old_status ~= new_status then
         current_state.status = new_status
         current_state.last_update = now
         wezterm.emit('agent_deck.status_changed', nil, pane, old_status, new_status, agent_type)
-        
-        if new_status == 'waiting' then
-            local last_notify = state.last_notification[pane_id] or 0
-            if (now - last_notify) > MIN_NOTIFICATION_GAP_MS then
-                notify_waiting(pane, agent_type, config)
-                state.last_notification[pane_id] = now
-                wezterm.emit('agent_deck.attention_needed', nil, pane, agent_type, 'waiting_for_input')
-            end
+
+        if new_status == 'waiting' and should_notify_waiting(pane_id) then
+            wezterm.log_warn('[agent-deck] NOTIFY pane=' .. pane_id .. ' ' .. old_status .. ' -> waiting')
+            notify_waiting(pane, agent_type, config)
+            mark_waiting_notified(pane_id)
+            wezterm.emit('agent_deck.attention_needed', nil, pane, agent_type, 'waiting_for_input')
         end
     else
         current_state.last_update = now
     end
-    
+
     current_state.agent_type = agent_type
     return current_state
 end
@@ -1001,9 +1076,15 @@ end
 
 function M.apply_to_config(config, opts)
     if opts then set_config(opts) end
-    
+
     local plugin_config = get_config()
     config.status_update_interval = plugin_config.update_interval
+
+    -- Suppress WezTerm's built-in OSC notifications to prevent duplicate/persistent
+    -- notifications from agents like Claude Code that send their own escape sequences
+    if plugin_config.notifications.suppress_osc_notifications then
+        config.notification_handling = 'NeverShow'
+    end
     
     if plugin_config.tab_title.enabled then
         wezterm.on('format-tab-title', function(tab, tabs, panes, wezterm_config, hover, max_width)
