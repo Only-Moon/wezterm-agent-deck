@@ -21,16 +21,25 @@ local default_config = {
         opencode = {
             patterns = { 'opencode' },
             executable_patterns = {
+                -- Platform-specific binaries
                 'opencode%-darwin',
                 'opencode%-linux',
                 'opencode%-win',
+                -- Local install path
                 '%.opencode/bin/opencode',
+                -- NPM package org path
                 '/opencode%-ai/',
+                -- Go install path (~/go/bin/opencode)
+                '/go/bin/opencode',
+                -- Homebrew
+                '/homebrew/bin/opencode',
+                -- Generic binary
                 '/opencode$',
             },
             argv_patterns = {
                 'bunx%s+opencode',
                 'npx%s+opencode',
+                'go%s+run%s+github%.com/opencode%-ai/opencode',
                 '/opencode$',
             },
             title_patterns = { 'opencode' },
@@ -39,15 +48,23 @@ local default_config = {
         claude = {
             patterns = { 'claude', 'claude%-code' },
             executable_patterns = {
+                -- NPM/legacy path
                 '@anthropic%-ai/claude%-code',
                 '/claude%-code/',
+                -- Homebrew cask
+                '/caskroom/claude%-code/',
+                -- Native installer (~/.claude/bin/claude)
+                '%.claude/bin/claude',
+                -- Generic binary
                 '/claude$',
-                '^claude%s*$',
+                '^claude$',
             },
             argv_patterns = {
                 '@anthropic%-ai/claude%-code',
                 'claude%-code',
-                '^claude%s*$',
+                '%.claude/bin/claude',
+                '^claude%s',
+                '^claude$',
             },
             title_patterns = {
                 'claude code',
@@ -61,6 +78,31 @@ local default_config = {
         },
         codex = {
             patterns = { 'codex' },
+            executable_patterns = {
+                -- NPM package path
+                '@openai/codex',
+                -- Homebrew cask
+                '/caskroom/codex/',
+                -- Platform-specific Rust binaries
+                'codex%-macos%-arm64',
+                'codex%-macos%-x86_64',
+                'codex%-linux%-x86_64',
+                'codex%-linux%-arm64',
+                -- Generic binary
+                '/codex$',
+                '^codex$',
+            },
+            argv_patterns = {
+                '@openai/codex',
+                'npx%s+@openai/codex',
+                'npx%s+codex',
+                'bunx%s+codex',
+                '^codex%s',
+                '^codex$',
+            },
+            title_patterns = {
+                'codex',
+            },
             status_patterns = nil,
         },
         aider = {
