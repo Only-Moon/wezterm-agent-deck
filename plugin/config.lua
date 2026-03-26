@@ -103,7 +103,16 @@ local default_config = {
             title_patterns = {
                 'codex',
             },
-            status_patterns = nil,
+            status_patterns = {
+                waiting = {
+                    'allow command%?',
+                    '%[y/n/e/a%]',
+                    '%[y/N/e/a%]',
+                    'yes, and don\'t ask again',
+                    'don\'t ask again this session',
+                    'don\'t ask again for this command',
+                },
+            },
         },
         aider = {
             patterns = { 'aider' },

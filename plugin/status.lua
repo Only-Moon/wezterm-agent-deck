@@ -61,6 +61,10 @@ local default_patterns = {
         'enter confirm',
         'esc dismiss',
         'type your own answer',
+        -- Codex approval patterns
+        'allow command',
+        '%[y/n/e/a%]',
+        '%[y/N/e/a%]',
     },
     
     -- Idle patterns - agent is ready for input
