@@ -916,11 +916,42 @@ local function notify_waiting(pane, agent_type, config)
     wezterm.log_info('[agent-deck] notification sent: ' .. subtitle)
 end
 
-local function notify_finished(pane_id, config)
+local function notify_finished(pane, pane_id, agent_type, config)
     -- Clear any lingering waiting notification for this pane
     if (config.notifications.backend or 'native') == 'terminal-notifier' then
         remove_terminal_notification(config, pane_group(config, pane_id))
     end
+
+    if not config.notifications.enabled or not config.notifications.on_finished then
+        return
+    end
+
+    local agent_name = get_agent_display_name(agent_type)
+    local subtitle = agent_name .. ' - Finished'
+    local message = 'Session ended'
+    local timeout_ms = config.notifications.timeout_ms or 4000
+    local backend = config.notifications.backend or 'native'
+
+    if backend == 'terminal-notifier' then
+        local tn_config = config.notifications.terminal_notifier or {}
+        if send_terminal_notifier(subtitle, message, config, {
+            group = pane_group(config, pane_id) .. '-finished',
+            sound = tn_config.finished_sound,
+        }) then
+            wezterm.log_info('[agent-deck] finished notification sent: ' .. subtitle)
+        end
+        return
+    end
+
+    local tab = pane:tab()
+    if not tab then return end
+    local mux_window = tab:window()
+    if not mux_window then return end
+    local gui_window = mux_window:gui_window()
+    if not gui_window then return end
+
+    gui_window:toast_notification(subtitle, message, nil, timeout_ms)
+    wezterm.log_info('[agent-deck] finished notification sent: ' .. subtitle)
 end
 
 --- Remove the notification for a pane when it's no longer waiting
@@ -973,7 +1004,7 @@ local function update_agent_state(pane, config)
             state.agent_states[pane_id] = nil
             detection_cache[pane_id] = nil
             clear_waiting_notified(pane_id)
-            notify_finished(pane_id, config)
+            notify_finished(pane, pane_id, current_state.agent_type, config)
             wezterm.emit('agent_deck.agent_finished', nil, pane, current_state.agent_type)
             if old_status ~= 'inactive' then
                 wezterm.emit('agent_deck.status_changed', nil, pane, old_status, 'inactive', nil)

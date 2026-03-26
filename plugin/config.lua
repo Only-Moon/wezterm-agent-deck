@@ -175,6 +175,7 @@ local default_config = {
     notifications = {
         enabled = true,
         on_waiting = true,   -- Notify when agent needs input
+        on_finished = true,  -- Notify when agent session ends
         suppress_osc_notifications = false,  -- Set notification_handling = "NeverShow" to suppress WezTerm's built-in OSC notifications
         timeout_ms = 4000,
         backend = 'native',  -- 'native' or 'terminal-notifier'
