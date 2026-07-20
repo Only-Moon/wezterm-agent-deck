@@ -173,9 +173,90 @@ end
 ---@param pane userdata WezTerm pane object
 ---@param config table Plugin configuration
 ---@return string|nil Agent type name or nil if no agent detected
+
+--- Recursively detect agent in a process subtree (post-order DFS)
+--- Prefers deeper/nested matches (e.g. pi running inside herdr multiplexer)
+---@param node table Process info node (executable/name/argv/children)
+---@param config table Plugin configuration
+---@param depth number Recursion depth guard (cycle/depth protection)
+---@return string|nil Agent type name or nil
+local function detect_in_subtree(node, config, depth)
+    if not node or depth > 8 then
+        return nil
+    end
+    if node.children then
+        for _, child in pairs(node.children) do
+            local found = detect_in_subtree(child, config, depth + 1)
+            if found then
+                return found
+            end
+        end
+    end
+    local executable = node.executable or ''
+    local name = node.name or ''
+    local argv = node.argv or {}
+    local argv_str = table.concat(argv, ' ')
+    local t = detect_from_process_info(executable, argv_str, config)
+    if not t and name ~= '' then
+        t = detect_from_process_info(name, argv_str, config)
+    end
+    return t
+end
+
+---
+--- Bridge to Herdr's own agent detection.
+--- WezTerm exposes only a single-level process tree, so an agent nested
+--- inside Herdr (pi is a grandchild: herdr -> pwsh -> node/pi) is invisible
+--- to the plugin. Herdr already detects the inner agent, so we query it via
+--- wezterm.run_child_process (the sandbox-safe native API, NOT Lua io.popen
+--- which WezTerm blocks). Result is cached globally so all panes share one
+--- `herdr agent list` call per TTL instead of one per pane.
+---@param config table Plugin configuration
+---@return string|nil Agent type name or nil
+local herdr_bridge_cache = { value = nil, ts = 0 }
+local HERDR_BRIDGE_TTL_MS = 2000
+local function detect_via_herdr(config)
+    local now = os.time() * 1000
+    if (now - herdr_bridge_cache.ts) < HERDR_BRIDGE_TTL_MS then
+        return herdr_bridge_cache.value
+    end
+
+    local HERDR = 'C:\\Users\\mohit\\AppData\\Local\\Programs\\Herdr\\bin\\herdr.exe'
+    local found = nil
+    -- Use pwsh (herdr only resolves under pwsh, not cmd)
+    local pcall_ok, success, stdout = pcall(wezterm.run_child_process,
+        { 'pwsh', '-NoLogo', '-c', HERDR .. ' agent list' })
+
+    if pcall_ok and success and stdout and stdout ~= '' then
+        if stdout:find('"agent"%s*:%s*"pi"') then
+            found = 'pi'
+        end
+    end
+
+    wezterm.log_info('[agent-deck] herdr-bridge pcall_ok=' .. tostring(pcall_ok)
+        .. ' success=' .. tostring(success) .. ' outlen=' .. tostring(stdout and #stdout or 0)
+        .. ' found=' .. tostring(found))
+
+    pcall(function()
+        wezterm.run_child_process({ 'pwsh', '-NoLogo', '-c',
+            'echo ' .. os.time() .. ' bridge pcall_ok=' .. tostring(pcall_ok) .. ' success=' .. tostring(success)
+            .. ' outlen=' .. tostring(stdout and #stdout or 0) .. ' found=' .. tostring(found)
+            .. ' >> C:/Users/mohit/agent-deck-bridge.log' })
+    end)
+
+    herdr_bridge_cache.value = found
+    herdr_bridge_cache.ts = now
+    return found
+end
+
 function M.detect_agent(pane, config)
     local pane_id = pane:pane_id()
-    
+
+    pcall(function()
+        wezterm.run_child_process({ 'pwsh', '-NoLogo', '-c',
+            'echo ' .. os.time() .. ' CALLED pane=' .. tostring(pane_id) .. ' >> C:/Users/mohit/agent-deck-bridge.log' })
+    end)
+
     -- Check cache first
     local cached = detection_cache[pane_id]
     if is_cache_valid(cached) then
@@ -190,33 +271,10 @@ function M.detect_agent(pane, config)
     end)
     
     if success and process_info then
-        local executable = process_info.executable or ''
-        local name = process_info.name or ''
-        local argv = process_info.argv or {}
-        local argv_str = table.concat(argv, ' ')
-        
-        agent_type = detect_from_process_info(executable, argv_str, config)
-        if not agent_type and name ~= '' then
-            agent_type = detect_from_process_info(name, argv_str, config)
-        end
-        
-        if not agent_type and process_info.children then
-            for _, child in pairs(process_info.children) do
-                local child_exe = child.executable or ''
-                local child_name = child.name or ''
-                local child_argv = table.concat(child.argv or {}, ' ')
-                
-                agent_type = detect_from_process_info(child_exe, child_argv, config)
-                if not agent_type and child_name ~= '' then
-                    agent_type = detect_from_process_info(child_name, child_argv, config)
-                end
-                if agent_type then
-                    break
-                end
-            end
-        end
+        wezterm.log_info('[agent-deck] foreground=' .. tostring(process_info.executable or 'nil'))
+        agent_type = detect_in_subtree(process_info, config, 0)
     end
-    
+
     -- Phase 2: Fallback to simpler process name
     if not agent_type then
         local name_success, process_name = pcall(function()
@@ -250,12 +308,26 @@ function M.detect_agent(pane, config)
         end
     end
     
+    -- Phase 4: bridge to Herdr's own agent detection.
+    -- Herdr hosts agents (e.g. pi) as grandchildren, invisible to the
+    -- single-level process tree. When Phases 1-3 found nothing, ask
+    -- Herdr directly (cached, sandbox-safe via run_child_process).
+    if not agent_type then
+        agent_type = detect_via_herdr(config)
+    end
+
     -- Update cache
     detection_cache[pane_id] = {
         agent_type = agent_type,
         timestamp = os.time() * 1000,
     }
-    
+
+    pcall(function()
+        wezterm.run_child_process({ 'pwsh', '-NoLogo', '-c',
+            'echo ' .. os.time() .. ' pane=' .. tostring(pane_id) .. ' agent=' .. tostring(agent_type)
+            .. ' >> C:/Users/mohit/agent-deck-bridge.log' })
+    end)
+
     return agent_type
 end
 

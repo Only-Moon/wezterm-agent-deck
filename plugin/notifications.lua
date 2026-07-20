@@ -38,6 +38,7 @@ local function get_notification_title(agent_type)
         gemini = 'Gemini',
         codex = 'Codex',
         aider = 'Aider',
+        pi = 'Pi',
     }
     
     return titles[agent_type] or (agent_type:sub(1, 1):upper() .. agent_type:sub(2))

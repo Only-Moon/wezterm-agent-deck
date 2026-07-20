@@ -177,9 +177,38 @@ local default_config = {
                 'claude',
             },
         },
-        gemini = { patterns = { 'gemini' } },
+        gemini = {
+            patterns = { 'gemini', 'agv', 'antigravity' },
+            executable_patterns = { 'agv', 'antigravity' },
+            argv_patterns = { 'agv', 'antigravity' },
+            title_patterns = { 'agv', 'antigravity' },
+        },
         codex = { patterns = { 'codex' } },
         aider = { patterns = { 'aider' } },
+        pi = {
+            -- @earendil-works/pi-coding-agent (the "pi" coding agent)
+            -- Runs as `node .../pi-coding-agent/dist/cli.js`; the shim `pi`
+            -- execs node, so match the cli.js path in argv. The interactive
+            -- TUI also sets the terminal title to "π - <session> - <cwd>".
+            patterns = { 'pi-coding-agent', 'pi%-coding%-agent' },
+            executable_patterns = {
+                'pi-coding-agent',
+                'pi-coding-agent[/\\]dist[/\\]cli%.js',
+            },
+            argv_patterns = {
+                'pi-coding-agent',
+                'pi%-coding%-agent',
+                -- bare `pi` invocation (shim / npx / bunx)
+                '^pi%s',
+                '^pi$',
+            },
+            title_patterns = { 'π', 'pi-coding-agent' },
+            status_patterns = {
+                -- pi's footer shows "Working..." / "Thinking..." while active and
+                -- renders empty lines when idle, so match the footer text exactly.
+                working = { 'working%.%.%.', 'thinking%.%.%.', 'streaming%.%.%.' },
+            },
+        },
     },
     
     tab_title = {
@@ -385,6 +414,59 @@ local function detect_from_title(pane_title, config)
     return nil
 end
 
+--- Bridge to Herdr's own agent detection.
+--- WezTerm exposes only a single-level process tree, so an agent nested
+--- inside Herdr (pi is a grandchild: herdr -> pwsh -> node/pi) is invisible
+--- to the plugin. Herdr already detects the inner agent, so we query it via
+--- wezterm.run_child_process (sandbox-safe native API, NOT Lua io.popen).
+--- Cached globally so all panes share one `herdr agent list` per TTL.
+local herdr_bridge_cache = { agent = nil, status = nil, ts = 0 }
+local HERDR_BRIDGE_TTL_MS = 2000
+-- Herdr runs inside a WeZTerm pane; pi is a grandchild (herdr -> pwsh -> node/pi)
+-- invisible to WeZTerm's process tree. Herdr's own `pane current` reports the
+-- focused inner agent + its status, so we ask it directly via
+-- wezterm.run_child_process (sandbox-safe native API). We only label THIS pane
+-- when it actually hosts Herdr (its foreground process is herdr), so we never
+-- mislabel other panes. Status comes straight from herdr (idle/working/...),
+-- not from scrollback matching, which would misread herdr's own TUI.
+local function map_herdr_status(s)
+    s = (s or ''):lower()
+    if s == 'working' then return 'working' end
+    if s == 'blocked' then return 'waiting' end
+    if s == 'done' or s == 'idle' then return 'idle' end
+    if s == 'unknown' then return 'inactive' end
+    return 'inactive'
+end
+
+-- Herdr runs inside a WeZTerm pane; pi is a grandchild (herdr -> pwsh -> node/pi)
+-- invisible to WeZTerm's process tree. The herdr Window Title Sync plugin runs
+-- UNDER herdr (where it can reach the herdr CLI) and already publishes the
+-- focused agent + status to %TEMP%/herdr-agent as "agent|status". We just read
+-- that file here -- no run_child_process inside this plugin (sandboxed), and only
+-- for panes that actually host Herdr, so we never mislabel other panes.
+local function detect_via_herdr(pane)
+    local proc = ''
+    pcall(function() proc = pane:get_foreground_process_name() or '' end)
+    if not proc:lower():find('herdr') then
+        return nil
+    end
+
+    local dir = os.getenv('HERDR_PLUGIN_STATE_DIR') or os.getenv('TEMP') or '/tmp'
+    local path = dir:gsub('\\', '/'):gsub('/$', '') .. '/herdr-agent'
+    local ok, f = pcall(io.open, path, 'r')
+    if not ok or not f then return nil end
+    local content = f:read('*a') or ''
+    f:close()
+
+    local agent = content:match('^%s*([^|\n]+)')
+    local status = content:match('|%s*(%S+)') or 'unknown'
+    if agent == 'pi' then
+        herdr_bridge_cache.status = status
+        return 'pi'
+    end
+    return nil
+end
+
 local function detect_agent(pane, config)
     local pane_id = pane:pane_id()
     local now = os.time() * 1000
@@ -448,7 +530,15 @@ local function detect_agent(pane, config)
             end
         end
     end
-    
+
+    -- Phase 4: bridge to Herdr's own agent detection.
+    -- Herdr hosts agents (e.g. pi) as grandchildren, invisible to the
+    -- single-level process tree. When Phases 1-3 found nothing, ask
+    -- Herdr directly (cached, sandbox-safe via run_child_process).
+    if not agent_type then
+        agent_type = detect_via_herdr(pane)
+    end
+
     detection_cache[pane_id] = { agent_type = agent_type, timestamp = now }
     return agent_type
 end
@@ -881,6 +971,7 @@ local function get_agent_display_name(agent_type)
         gemini = 'Gemini',
         codex = 'Codex',
         aider = 'Aider',
+        pi = 'Pi',
     }
     return agent_names[agent_type] or agent_type
 end
@@ -1018,7 +1109,19 @@ local function update_agent_state(pane, config)
         current_state.undetected_since = nil
     end
 
-    local new_status = detect_status(pane, agent_type, config)
+    local new_status
+    if agent_type == 'pi' then
+        -- pi is nested inside Herdr; use Herdr's reported status instead of
+        -- scrollback matching (which would read Herdr's own TUI text).
+        detect_via_herdr(pane)  -- refresh cache if TTL expired
+        if herdr_bridge_cache.agent == 'pi' and herdr_bridge_cache.status then
+            new_status = map_herdr_status(herdr_bridge_cache.status)
+        else
+            new_status = 'inactive'
+        end
+    else
+        new_status = detect_status(pane, agent_type, config)
+    end
 
     if not current_state then
         current_state = {
@@ -1106,6 +1209,12 @@ function M.setup(opts)
 end
 
 function M.apply_to_config(config, opts)
+    -- DEBUG: one-time subprocess availability test (isolates run_child_process
+    -- from the herdr logic). Check overlay (Ctrl+Shift+L) for RCP_TEST.
+    local t_ok, t_success, t_out = pcall(wezterm.run_child_process, { 'cmd.exe', '/c', 'echo RCP_TEST' })
+    wezterm.log_info('[agent-deck] RCP_TEST ok=' .. tostring(t_ok)
+        .. ' success=' .. tostring(t_success) .. ' out=' .. tostring(t_out))
+
     if opts then set_config(opts) end
 
     local plugin_config = get_config()
@@ -1184,6 +1293,23 @@ M.get_status_color = get_status_color
 M.get_status_icon = get_status_icon
 M.update_pane = function(pane)
     return update_agent_state(pane, get_config())
+end
+
+-- Set agent state directly (used by the config side, e.g. mini-bar, which can
+-- read herdr's published agent file even when the plugin sandbox blocks IO).
+-- Lets nested agents like pi (invisible to the process tree) be reported.
+M.inject_agent = function(pane, agent_type, status)
+    if not pane then return end
+    local pane_id = pane:pane_id()
+    local now = os.time() * 1000
+    state.agent_states[pane_id] = {
+        agent_type = agent_type,
+        status = status or 'inactive',
+        last_update = now,
+        cooldown_start = nil,
+        undetected_since = nil,
+    }
+    detection_cache[pane_id] = { agent_type = agent_type, timestamp = now }
 end
 
 return M

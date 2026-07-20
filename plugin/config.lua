@@ -118,6 +118,23 @@ local default_config = {
             patterns = { 'aider' },
             status_patterns = nil,
         },
+        pi = {
+            patterns = { 'pi-coding-agent', 'pi%-coding%-agent' },
+            executable_patterns = {
+                'pi-coding-agent',
+                'pi-coding-agent[/\\]dist[/\\]cli%.js',
+            },
+            argv_patterns = {
+                'pi-coding-agent',
+                'pi%-coding%-agent',
+                '^pi%s',
+                '^pi$',
+            },
+            title_patterns = { 'π', 'pi-coding-agent' },
+            status_patterns = {
+                working = { 'working%.%.%.', 'thinking%.%.%.', 'streaming%.%.%.' },
+            },
+        },
     },
     
     -- Tab title format (composable)
